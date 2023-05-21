@@ -759,10 +759,13 @@ def supplement_generator_860_data(
             "technology_description",
             "time_cold_shutdown_full_load_code",
             "planned_retirement_date",
+            "prime_mover_code",
         ]
     )
+    gen_cols = [c for c in gen_cols if c in gens_860]
 
     entity_cols = ["plant_id_eia", "generator_id", "prime_mover_code", "operating_date"]
+    entity_cols = [c for c in entity_cols if c in gens_entity]
 
     bga_cols = [
         "plant_id_eia",
@@ -880,7 +883,7 @@ def remove_canceled_860m(df, canceled_860m):
     if not canceled.empty:
         assert len(df) == len(canceled) + len(not_canceled_df)
 
-    return not_canceled_df
+    return not_canceled_df.reset_index(drop=True)
 
 
 def remove_retired_860m(df, retired_860m):
@@ -911,7 +914,7 @@ def remove_retired_860m(df, retired_860m):
     if not retired.empty:
         assert len(df) == len(retired) + len(not_retired_df)
 
-    return not_retired_df
+    return not_retired_df.reset_index(drop=True)
 
 
 def remove_future_retirements_860m(df, retired_860m):
@@ -968,15 +971,24 @@ def update_operating_date_860m(
         The original "df" dataframe with missing operating dates filled using the operating
         year from 860m.
     """
-    df = df.set_index(["plant_id_eia", "generator_id"])
-    operating_860m = operating_860m.set_index(["plant_id_eia", "generator_id"])
-    no_op_date = set(df.loc[df["operating_date"].isna(), :].index)
-    df.loc[no_op_date, "operating_date"] = pd.to_datetime(
-        operating_860m.reindex(no_op_date).dropna(how="all")["operating_year"],
+    _df = df.set_index(["plant_id_eia", "generator_id"])
+    _operating_860m = operating_860m.set_index(["plant_id_eia", "generator_id"])
+    no_op_date = _df.loc[_df["operating_date"].isna(), :]
+    no_op_date = pd.merge(
+        no_op_date,
+        _operating_860m["operating_year"],
+        left_index=True,
+        right_index=True,
+        how="left",
+        validate="1:1",
+    )
+
+    _df.loc[no_op_date.index, "operating_date"] = pd.to_datetime(
+        no_op_date.loc[no_op_date["operating_year"].notna(), "operating_year"],
         format="%Y",
     )
 
-    return df.reset_index()
+    return _df.reset_index()
 
 
 def load_923_gen_fuel_data(pudl_engine, pudl_out, model_region_map, data_years=[2017]):
@@ -1173,7 +1185,6 @@ def calculate_weighted_heat_rate(heat_rate_df):
     """
 
     def w_hr(df):
-
         weighted_hr = np.average(
             df["heat_rate_mmbtu_mwh"], weights=df["net_generation_mwh"]
         )
@@ -1678,17 +1689,21 @@ def import_new_generators(
     pd.DataFrame
         Set of operating generators that were not already in the gens_860 dataframe
     """
-    operating_860m["generator_id"] = operating_860m["generator_id"].apply(
+    _operating_860m = operating_860m.copy()
+    _operating_860m["generator_id"] = _operating_860m["generator_id"].apply(
         remove_leading_zero
     )
     gens_860_id = list(zip(gens_860["plant_id_eia"], gens_860["generator_id"]))
     operating_860m_id = zip(
-        operating_860m["plant_id_eia"], operating_860m["generator_id"]
+        _operating_860m["plant_id_eia"], _operating_860m["generator_id"]
     )
 
     new_mask = [g not in gens_860_id for g in operating_860m_id]
     new_operating = label_gen_region(
-        operating_860m.loc[new_mask, :], settings, model_regions_gdf
+        _operating_860m.loc[new_mask, :], settings, model_regions_gdf
+    )
+    new_operating = new_operating.drop_duplicates(
+        subset=["plant_id_eia", "generator_id"]
     )
     new_operating.loc[:, "heat_rate_mmbtu_mwh"] = new_operating.loc[
         :, "technology_description"
@@ -1818,8 +1833,10 @@ def import_proposed_generators(
     #     planned_gdf = planned_gdf.to_crs(model_regions_gdf.crs)
 
     # planned_gdf = gpd.sjoin(model_regions_gdf.drop(columns="IPM_Region"), planned_gdf)
-
-    planned_gdf = label_gen_region(planned, settings, model_regions_gdf)
+    _planned = planned.copy()
+    _planned["generator_id"] = _planned["generator_id"].apply(remove_leading_zero)
+    planned_gdf = label_gen_region(_planned, settings, model_regions_gdf)
+    planned_gdf = planned_gdf.drop_duplicates(subset=["plant_id_eia", "generator_id"])
 
     # Add planned additions from the settings file
     additional_planned = settings.get("additional_planned") or []
@@ -2626,6 +2643,7 @@ def load_demand_response_efs_profile(
     model_regions: list,
     region_aggregations: dict = {},
     path_in: Path = None,
+    utc_offset: int = None,
 ) -> pd.DataFrame:
     """Load the demand profile of a single flexible resource in all model regions.
 
@@ -2649,6 +2667,9 @@ def load_demand_response_efs_profile(
     path_in : Path, optional
         Folder where stock and incremental factor (profile) data are located, by default
         None.
+    utc_offset: int, optional
+        Number of hours that should be shifted from the default UTC time that data are
+        stored in.
 
     Returns
     -------
@@ -2683,9 +2704,14 @@ def load_demand_response_efs_profile(
     dr_profile.columns = dr_profile.columns.droplevel()
     for model_region, base_regs in region_aggregations.items():
         base_regs = [r for r in base_regs if r != model_region]
-        dr_profile[model_region] = dr_profile[base_regs].sum(axis=1)
-        dr_profile = dr_profile.drop(columns=base_regs)
+        dr_profile[model_region] = dr_profile.reindex(
+            columns=base_regs, fill_value=0
+        ).sum(axis=1)
+        dr_profile = dr_profile.drop(columns=base_regs, errors="ignore")
 
+    if utc_offset:
+        for col in dr_profile.columns:
+            dr_profile[col] = np.roll(dr_profile[col].values, utc_offset)
     return dr_profile
 
 
@@ -2865,7 +2891,6 @@ class GeneratorClusters:
         for resource, parameters in (
             self.settings["flexible_demand_resources"].get(year, {}).items()
         ):
-
             _df = pd.DataFrame(
                 index=self.settings["model_regions"],
                 columns=list(self.settings["generator_columns"]) + ["profile"],
@@ -2905,6 +2930,7 @@ class GeneratorClusters:
                     keep_regions,
                     self.settings.get("region_aggregations", {}) or {},
                     self.settings.get("EFS_DATA"),
+                    self.settings.get("utc_offset"),
                 )
             self.demand_response_profiles[resource] = dr_profile
             # Add hourly profile to demand response rows
@@ -3110,7 +3136,7 @@ class GeneratorClusters:
                         ["plant_id_eia", "model_region"]
                     ].drop_duplicates(),
                 ]
-            )
+            ).drop_duplicates(subset=["plant_id_eia", "model_region"])
             # embed()
             logger.info(
                 f"Proposed gen technologies are "
@@ -3280,7 +3306,6 @@ class GeneratorClusters:
                     region in alt_cluster_method
                     and tech in alt_cluster_method[region]["technology_description"]
                 ):
-
                     grouped = cluster_by_owner(
                         df,
                         self.weighted_ownership,
@@ -3538,7 +3563,6 @@ class GeneratorClusters:
         return self.new_generators
 
     def create_all_generators(self):
-
         if self.current_gens:
             self.existing_resources = self.create_region_technology_clusters()
 
